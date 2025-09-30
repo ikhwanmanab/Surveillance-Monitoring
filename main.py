@@ -3,13 +3,26 @@ import cv2
 import numpy as np
 import tempfile
 import os
+from functools import lru_cache
+
+# YOLO
 from ultralytics import YOLO
 from ultralytics.engine.results import Boxes
 
-# for browser webcam
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoTransformerBase
+# Browser webcam (WebRTC)
+from streamlit_webrtc import (
+    webrtc_streamer,
+    WebRtcMode,
+    VideoTransformerBase,
+    RTCConfiguration,
+)
 import av
+
+# Video decoding fallback
 import imageio.v3 as iio
+
+# Optional: for runtime model download if you add a URL later
+import requests
 
 # ------------------------------------------------------------
 # Streamlit page setup
@@ -18,51 +31,106 @@ st.set_page_config(page_title="YOLOv8 Human & Luggage", layout="wide")
 st.title("YOLOv8 Detection: Human & Luggage 🚀")
 
 # ------------------------------------------------------------
-# Sidebar Settings
+# Paths & constants
 # ------------------------------------------------------------
-st.sidebar.header("Settings")
-mode = st.sidebar.radio("Select Model:", ["Custom (bestV3.pt)", "COCO (filtered)"], index=0)
+COCO_PATH = "yolov8n.pt"          # keep at repo root (already in your repo)
+CUSTOM_PATH = "models/bestV3.pt"  # your custom model (may not exist online)
+
+ALLOWED_COCO_REMAP = {"person": "human", "suitcase": "luggage"}
+
+# WebRTC ICE servers (needed online)
+RTC_CFG = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        # Add TURN for stricter networks:
+        # {"urls": ["turn:YOUR_TURN:3478"], "username": "USER", "credential": "PASS"},
+    ]
+})
+
+# ------------------------------------------------------------
+# Sidebar controls
+# ------------------------------------------------------------
+options = ["COCO (filtered)", "Custom (bestV3.pt)"]
+mode = st.sidebar.radio("Select Model:", options, index=0)
 CONF = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.5)
 
-# Allowed class remap for COCO
-allowed_classes = {"person": "human", "suitcase": "luggage"}
+# ------------------------------------------------------------
+# Helpers: detect Git LFS pointer & optional downloader
+# ------------------------------------------------------------
+def is_lfs_pointer(path: str) -> bool:
+    try:
+        # LFS pointer files are tiny and contain "git-lfs" text
+        if not os.path.exists(path) or os.path.getsize(path) < 2048:
+            with open(path, "rb") as f:
+                head = f.read(512).decode("utf-8", "ignore")
+            return "git-lfs" in head.lower()
+    except Exception:
+        pass
+    return False
+
+def download_if_missing(url: str, path: str):
+    """Optional helper: download a file at runtime if missing/LFS pointer."""
+    need = (not os.path.exists(path)) or is_lfs_pointer(path)
+    if not need:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    st.info(f"Downloading model to `{path}` …")
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
 # ------------------------------------------------------------
-# Load models once
+# Lazy model loader (prevents startup crash if custom model missing)
 # ------------------------------------------------------------
-@st.cache_resource
-def load_custom():
-    return YOLO("models/bestV3.pt")
+@lru_cache(maxsize=2)
+def load_model(selected_mode: str) -> YOLO:
+    if selected_mode.startswith("Custom"):
+        # If hosting externally, uncomment and set your URL:
+        # download_if_missing("https://YOUR_HOST/bestV3.pt", CUSTOM_PATH)
+        if not os.path.exists(CUSTOM_PATH) or is_lfs_pointer(CUSTOM_PATH):
+            raise FileNotFoundError(
+                "Custom model `models/bestV3.pt` is missing or is a Git LFS pointer.\n"
+                "Use COCO (filtered) for demo, or host the file and enable runtime download."
+            )
+        return YOLO(CUSTOM_PATH)
+    else:
+        return YOLO(COCO_PATH)
 
-@st.cache_resource
-def load_coco():
-    return YOLO("yolov8n.pt")
-
-custom_model = load_custom()
-coco_model = load_coco()
+# Acquire active model (show friendly error if custom is unavailable)
+try:
+    active_model = load_model(mode)
+except FileNotFoundError as e:
+    st.error(str(e))
+    st.stop()
 
 # ------------------------------------------------------------
-# Detection logic
+# Inference / drawing
 # ------------------------------------------------------------
-def process_frame(frame, mode, conf, custom_model, coco_model):
-    if mode == "Custom (bestV3.pt)":
-        res = custom_model(frame, conf=conf)[0]
-    else:  # COCO (filtered)
-        res = coco_model(frame, conf=conf)[0]
-        mask = [coco_model.names[int(c)] in allowed_classes for c in res.boxes.cls]
+def process_frame(frame_bgr: np.ndarray, mode: str, conf: float, active_model: YOLO) -> np.ndarray:
+    """Run YOLO and return an annotated BGR frame."""
+    res = active_model(frame_bgr, conf=conf)[0]
+
+    # If using COCO model, filter to person + suitcase and relabel
+    if mode.startswith("COCO"):
+        mask = [active_model.names[int(c)] in ALLOWED_COCO_REMAP for c in res.boxes.cls]
         if any(mask):
             res.boxes = Boxes(res.boxes.data[np.array(mask)], res.orig_shape)
             for c in res.boxes.cls:
-                old = coco_model.names[int(c)]
-                res.names[int(c)] = allowed_classes[old]
+                old = active_model.names[int(c)]
+                res.names[int(c)] = ALLOWED_COCO_REMAP[old]
         else:
-            res.boxes = Boxes(res.boxes.data[:0], res.orig_shape)  # empty
+            res.boxes = Boxes(res.boxes.data[:0], res.orig_shape)
+
+    # res.plot() returns BGR image with rendered boxes/labels
     return res.plot()
 
 # ------------------------------------------------------------
-# Video annotation (OpenCV + fallback to imageio)
+# Video annotation (OpenCV with imageio fallback)
 # ------------------------------------------------------------
-def annotate_video(input_path, output_path, mode, conf, custom_model, coco_model):
+def annotate_video(input_path: str, output_path: str, mode: str, conf: float, active_model: YOLO) -> bool:
     cap = cv2.VideoCapture(input_path)
     if cap.isOpened():
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -70,55 +138,64 @@ def annotate_video(input_path, output_path, mode, conf, custom_model, coco_model
         fps = cap.get(cv2.CAP_PROP_FPS) or 24
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
         frame_placeholder = st.empty()
         prog = st.progress(0.0)
         total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1, 1)
         idx = 0
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            annotated = process_frame(frame, mode, conf, custom_model, coco_model)
+            annotated = process_frame(frame, mode, conf, active_model)
             out.write(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
             if idx % 3 == 0:
                 frame_placeholder.image(
                     cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                    caption=f"Video Detection ({mode})", use_container_width=True
+                    caption=f"Video Detection ({mode})",
+                    use_container_width=True,
                 )
                 prog.progress(min(idx / total, 0.999))
             idx += 1
+
         cap.release()
         out.release()
         prog.progress(1.0)
         return True
 
-    # Fallback: imageio
+    # Fallback: imageio (handles tricky codecs on cloud)
     try:
         reader = iio.imiter(input_path, plugin="FFMPEG", dtype="uint8")
         meta = iio.improps(input_path, plugin="FFMPEG")
         fps = getattr(meta, "fps", 24) or 24
         w, h = getattr(meta, "size", (None, None))
+
         if w is None or h is None:
             first = next(reader)
             h, w = first.shape[:2]
             frames_iter = (f for f in ([first] + list(reader)))
         else:
             frames_iter = reader
+
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
         frame_placeholder = st.empty()
         prog = st.progress(0.0)
+
         processed = 0
         for f in frames_iter:
             frame_bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
-            annotated = process_frame(frame_bgr, mode, conf, custom_model, coco_model)
+            annotated = process_frame(frame_bgr, mode, conf, active_model)
             out.write(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
             if processed % 3 == 0:
                 frame_placeholder.image(
                     cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                    caption=f"Video Detection ({mode})", use_container_width=True
+                    caption=f"Video Detection ({mode})",
+                    use_container_width=True,
                 )
             processed += 1
+
         out.release()
         prog.progress(1.0)
         return True
@@ -127,24 +204,22 @@ def annotate_video(input_path, output_path, mode, conf, custom_model, coco_model
         return False
 
 # ------------------------------------------------------------
-# WebRTC transformer for browser webcam
+# WebRTC transformer (browser webcam)
 # ------------------------------------------------------------
 class YOLOTransformer(VideoTransformerBase):
-    def __init__(self, mode, conf, custom_model, coco_model):
+    def __init__(self, mode: str, conf: float, active_model: YOLO):
         self.mode = mode
         self.conf = conf
-        self.custom_model = custom_model
-        self.coco_model = coco_model
+        self.active_model = active_model
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        annotated = process_frame(img, self.mode, self.conf, self.custom_model, self.coco_model)
-        return av.VideoFrame.from_ndarray(
-            cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), format="rgb24"
-        )
+        img_bgr = frame.to_ndarray(format="bgr24")
+        annotated = process_frame(img_bgr, self.mode, self.conf, self.active_model)
+        # WebRTC expects RGB frames
+        return av.VideoFrame.from_ndarray(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), format="rgb24")
 
 # ------------------------------------------------------------
-# Tabs
+# Tabs UI
 # ------------------------------------------------------------
 tab1, tab2, tab3 = st.tabs(["📷 Image", "🎞️ Video File", "🎥 Live Camera"])
 
@@ -155,6 +230,7 @@ with tab1:
     img_file = None
     if not use_sample:
         img_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
+
     if use_sample:
         frame = cv2.imread("samples/test_image.jpg")
     elif img_file:
@@ -162,12 +238,13 @@ with tab1:
         frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     else:
         frame = None
+
     if frame is not None:
-        annotated = process_frame(frame, mode, CONF, custom_model, coco_model)
+        annotated = process_frame(frame, mode, CONF, active_model)
         st.image(
             cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
             caption=f"Detections ({mode})",
-            use_container_width=True
+            use_container_width=True,
         )
 
 # ---------- Tab 2: Video ----------
@@ -177,6 +254,7 @@ with tab2:
     vid_file = None
     if not use_sample_vid:
         vid_file = st.file_uploader("Choose a video", type=["mp4", "mov", "avi", "mkv"])
+
     if use_sample_vid:
         video_path = "samples/test_video.mp4"
     elif vid_file:
@@ -185,9 +263,10 @@ with tab2:
         video_path = tfile.name
     else:
         video_path = None
+
     if video_path:
         t_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        success = annotate_video(video_path, t_out.name, mode, CONF, custom_model, coco_model)
+        success = annotate_video(video_path, t_out.name, mode, CONF, active_model)
         if success:
             st.success("Processing complete ✅")
             st.video(t_out.name)
@@ -196,16 +275,19 @@ with tab2:
                     "Download Annotated Video",
                     data=f,
                     file_name="annotated_output.mp4",
-                    mime="video/mp4"
+                    mime="video/mp4",
                 )
 
 # ---------- Tab 3: Webcam ----------
 with tab3:
     st.subheader("Webcam Stream (Browser)")
-    st.caption("This captures from your browser, not the server.")
-    webrtc_streamer(
+    st.caption("Runs in your browser via WebRTC; grant camera permission to start.")
+    ctx = webrtc_streamer(
         key="yolo-webrtc",
         mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CFG,
         media_stream_constraints={"video": True, "audio": False},
-        video_transformer_factory=lambda: YOLOTransformer(mode, CONF, custom_model, coco_model),
+        video_transformer_factory=lambda: YOLOTransformer(mode, CONF, active_model),
     )
+    if ctx and ctx.state.playing:
+        st.success("Webcam connected.")
