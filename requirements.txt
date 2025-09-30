@@ -1,9 +1,22 @@
-streamlit
-ultralytics
-opencv-python-headless
-numpy
-Pillow
-torch
-torchvision
-torchaudio
+# Core
+streamlit==1.39.0
 
+# Computer Vision
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# YOLOv8 + dependencies
+ultralytics==8.3.25
+torch==2.4.1
+torchvision==0.19.1
+
+# For browser webcam
+streamlit-webrtc==0.47.7
+av==12.3.0
+
+# Video decoding fallback
+imageio==2.36.0
+imageio-ffmpeg==0.5.1
+
+# Utilities
+typing_extensions>=4.8.0
