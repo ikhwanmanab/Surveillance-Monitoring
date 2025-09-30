@@ -12,7 +12,7 @@ st.title("YOLOv8 Detection: Human & Luggage 🚀")
 
 # ---------------- Settings ----------------
 st.sidebar.header("Settings")
-mode = st.sidebar.radio("Select Model:", ["Custom (best.pt)", "COCO (filtered)"], index=0)
+mode = st.sidebar.radio("Select Model:", ["Custom (bestV3.pt)", "COCO (filtered)"], index=0)
 CONF = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.5)
 
 # Allowed class remap for COCO
@@ -138,5 +138,6 @@ with tab3:
             FRAME_WINDOW.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
                                caption=f"Live Detection ({mode})", use_container_width=True)
         cap.release()
+
 
 
